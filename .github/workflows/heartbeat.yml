@@ -1,0 +1,125 @@
+name: Polylogic Orchestrator Heartbeat
+
+# Curls the orchestrator daemon /heartbeat endpoint on the openclaw VM
+# every 5 minutes. If the daemon is unreachable, posts a Telegram alert
+# to Andy (chat_id in repo secrets) and marks status.json as down. The
+# workflow also publishes docs/status.json to GitHub Pages so that
+# status.polylogicai.com can render without any back-end.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Curl orchestrator heartbeat
+        id: ping
+        run: |
+          set +e
+          BODY=$(curl -sf -m 10 "http://165.22.46.178:4848/heartbeat")
+          STATUS=$?
+          if [ $STATUS -eq 0 ]; then
+            echo "status=200" >> $GITHUB_OUTPUT
+            echo "$BODY" > /tmp/heartbeat.json
+            echo "alive=true" >> $GITHUB_OUTPUT
+          else
+            echo "status=down" >> $GITHUB_OUTPUT
+            echo "alive=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Alert Telegram on failure
+        if: steps.ping.outputs.alive != 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ANDY_CHAT_ID: ${{ secrets.TELEGRAM_ANDY_CHAT_ID }}
+        run: |
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          curl -sf -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":$TELEGRAM_ANDY_CHAT_ID,\"text\":\"Polylogic Orchestrator heartbeat MISSED at $TS. Status: ${{ steps.ping.outputs.status }}. SSH to openclaw and run: sudo systemctl status polybrain-orchestrator\"}"
+
+      - name: Update status.json
+        run: |
+          mkdir -p docs
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ALIVE='${{ steps.ping.outputs.alive }}'
+          STATUS_CODE='${{ steps.ping.outputs.status }}'
+          if [ "$ALIVE" = "true" ] && [ -f /tmp/heartbeat.json ]; then
+            ROW_COUNT=$(jq -r '.canon_stats.row_count // 0' /tmp/heartbeat.json)
+            UPTIME=$(jq -r '.uptime_ms // 0' /tmp/heartbeat.json)
+            BOOTED=$(jq -r '.booted_at // ""' /tmp/heartbeat.json)
+            PID=$(jq -r '.pid // 0' /tmp/heartbeat.json)
+          else
+            ROW_COUNT=0
+            UPTIME=0
+            BOOTED=""
+            PID=0
+          fi
+          cat > docs/status.json <<EOF
+          {
+            "checked_at": "$TS",
+            "orchestrator_alive": $ALIVE,
+            "orchestrator_http_status": "$STATUS_CODE",
+            "booted_at": "$BOOTED",
+            "uptime_ms": $UPTIME,
+            "pid": $PID,
+            "canon_row_count": $ROW_COUNT,
+            "checked_by": "github-actions-cron",
+            "source": "https://github.com/polylogicai/canon/actions/workflows/heartbeat.yml"
+          }
+          EOF
+
+      - name: Update status.html (for GitHub Pages)
+        run: |
+          mkdir -p docs
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ALIVE='${{ steps.ping.outputs.alive }}'
+          cat > docs/index.html <<EOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>Polylogic AI · status</title>
+            <style>
+              body { font-family: system-ui, sans-serif; background: #0a0f1a; color: #e8e6e1; max-width: 640px; margin: 48px auto; padding: 24px; }
+              h1 { color: #F5A623; font-weight: 700; font-size: 28px; margin: 0 0 8px; }
+              .sub { color: #9ca0a6; font-size: 14px; margin: 0 0 24px; }
+              .pill { display: inline-block; padding: 6px 12px; border-radius: 999px; font-size: 14px; font-weight: 600; }
+              .alive { background: #1a3a2a; color: #5fd67a; }
+              .down { background: #3a1a1a; color: #e06868; }
+              pre { background: #121824; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+              a { color: #5E92A8; }
+            </style>
+          </head>
+          <body>
+            <h1>Polylogic AI status</h1>
+            <p class="sub">Canonical heartbeat for the orchestrator daemon on openclaw. Updated every 5 minutes by GitHub Actions.</p>
+            <p class="pill $([ "$ALIVE" = "true" ] && echo alive || echo down)">$([ "$ALIVE" = "true" ] && echo "orchestrator · alive" || echo "orchestrator · down")</p>
+            <p class="sub">Last checked: $TS (UTC)</p>
+            <h2>Raw JSON</h2>
+            <pre><a href="./status.json">./status.json</a></pre>
+            <p class="sub"><a href="https://github.com/polylogicai/canon">canon repo</a> · <a href="https://polylogicai.com">polylogicai.com</a></p>
+          </body>
+          </html>
+          EOF
+
+      - name: Commit status
+        run: |
+          git config user.name "polylogic-status-bot"
+          git config user.email "noreply@polylogicai.com"
+          git add docs/status.json docs/index.html
+          git diff --cached --quiet || git commit -m "status: $(date -u +%Y-%m-%dT%H:%M:%SZ) orchestrator=${{ steps.ping.outputs.status }}"
+          git push || true
